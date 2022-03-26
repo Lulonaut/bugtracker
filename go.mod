@@ -3,6 +3,7 @@ module bt
 go 1.18
 
 require (
+	github.com/golang-jwt/jwt v3.2.2+incompatible
 	github.com/golang/gddo v0.0.0-20210115222349-20d68f94ee1f
 	github.com/jackc/pgx/v4 v4.15.0
 	golang.org/x/crypto v0.0.0-20220321153916-2c7772ba3064

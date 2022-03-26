@@ -4,13 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/golang-jwt/jwt"
 	"github.com/golang/gddo/httputil/header"
 	"github.com/jackc/pgx/v4/pgxpool"
 	"golang.org/x/crypto/bcrypt"
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 )
 
 var databasePool *pgxpool.Pool
@@ -21,7 +24,7 @@ type Response struct {
 	Object  string `json:"object,omitempty"`
 }
 
-type RegisterAndLoginInfo struct {
+type AuthenticationInfo struct {
 	Username string
 	Password string
 }
@@ -54,7 +57,7 @@ func enforceValidUsername(username string, w http.ResponseWriter) bool {
 	return true
 }
 
-func enforceNonEmptyValues(info RegisterAndLoginInfo, w http.ResponseWriter) bool {
+func enforceNonEmptyValues(info AuthenticationInfo, w http.ResponseWriter) bool {
 	if info.Username == "" || info.Password == "" {
 		badRequestErrorResponse(w)
 		return false
@@ -102,81 +105,6 @@ func sendResponse(w http.ResponseWriter, status int, success bool, cause string,
 		cause,
 		obj,
 	})
-}
-
-func loginUser(w http.ResponseWriter, r *http.Request) {
-	if !enforceMethod(http.MethodPost, w, r) {
-		return
-	}
-	var details RegisterAndLoginInfo
-	decodeSuccessful := decodeJSON(w, r, &details)
-	if !decodeSuccessful || !enforceValidUsername(details.Username, w) {
-		badRequestErrorResponse(w)
-		return
-	}
-
-	var hashedPassword string
-	err := databasePool.QueryRow(context.Background(), "select password_hash from users where LOWER(username) = LOWER('"+details.Username+"')").Scan(&hashedPassword)
-	if err != nil {
-		badRequestErrorResponse(w)
-		return
-	}
-
-	if !checkPasswordHash(details.Password, hashedPassword) {
-		sendResponse(
-			w,
-			http.StatusBadRequest,
-			false,
-			"Invalid password",
-			"")
-		return
-	} else {
-		//TODO
-	}
-
-}
-
-func registerAccount(w http.ResponseWriter, r *http.Request) {
-	if !enforceMethod(http.MethodPost, w, r) {
-		return
-	}
-	var details RegisterAndLoginInfo
-	decodeSuccessful := decodeJSON(w, r, &details)
-	if !decodeSuccessful {
-		badRequestErrorResponse(w)
-		return
-	}
-	if !enforceNonEmptyValues(details, w) || !enforceValidUsername(details.Username, w) || !enforceValidPassword(details.Password, w) {
-		return
-	}
-
-	hashedPassword, err := hashPassword(details.Password)
-	if err != nil {
-		internalServerErrorResponse(w)
-		return
-	}
-	_, err = databasePool.Exec(context.Background(), "INSERT INTO users (id, username, password_hash)\nVALUES (DEFAULT, $1, $2);", details.Username, hashedPassword)
-	if err != nil {
-		//check if the username is a duplicate entry
-		if strings.ContainsAny(err.Error(), "SQLSTATE 23505") {
-			sendResponse(
-				w,
-				http.StatusConflict,
-				false,
-				"Username already taken",
-				"")
-		} else {
-			internalServerErrorResponse(w)
-		}
-		return
-	}
-
-	sendResponse(
-		w,
-		http.StatusOK,
-		true,
-		"",
-		"")
 }
 
 func hashPassword(password string) (string, error) {
@@ -236,6 +164,146 @@ func loadEnv() {
 	}
 }
 
+func getUserIdFromJwt(tokenString string) (int, error) {
+	token, err := jwt.ParseWithClaims(tokenString, &jwt.StandardClaims{}, func(token *jwt.Token) (interface{}, error) {
+		return []byte(os.Getenv("JWT_SECRET")), nil
+	})
+
+	if err == nil {
+		if claims, ok := token.Claims.(*jwt.StandardClaims); ok && token.Valid {
+			id, err := strconv.Atoi(claims.Issuer)
+			if err == nil {
+				return id, nil
+			} else {
+				return -1, err
+			}
+		}
+	}
+	return -1, err
+}
+
+func testJwt(w http.ResponseWriter, r *http.Request) {
+	if !enforceMethod(http.MethodPost, w, r) {
+		return
+	}
+
+	token, err := r.Cookie("jwt")
+	if err != nil {
+		sendResponse(
+			w,
+			http.StatusUnauthorized,
+			false,
+			"Unauthorized",
+			"",
+		)
+		return
+	}
+	userid, err := getUserIdFromJwt(token.Value)
+	if err != nil {
+		println(err.Error())
+		badRequestErrorResponse(w)
+		return
+	}
+	sendResponse(
+		w,
+		http.StatusOK,
+		true,
+		"",
+		strconv.Itoa(userid),
+	)
+}
+
+func loginUser(w http.ResponseWriter, r *http.Request) {
+	if !enforceMethod(http.MethodPost, w, r) {
+		return
+	}
+	var details AuthenticationInfo
+	decodeSuccessful := decodeJSON(w, r, &details)
+	if !decodeSuccessful || !enforceValidUsername(details.Username, w) {
+		badRequestErrorResponse(w)
+		return
+	}
+
+	var hashedPassword string
+	var userid int
+	err := databasePool.QueryRow(context.Background(), "select password_hash, id from users where LOWER(username) = LOWER('"+details.Username+"')").Scan(&hashedPassword, &userid)
+	if err != nil {
+		println(err.Error())
+		badRequestErrorResponse(w)
+		return
+	}
+	if !checkPasswordHash(details.Password, hashedPassword) {
+		sendResponse(
+			w,
+			http.StatusBadRequest,
+			false,
+			"Invalid password",
+			"")
+		return
+	}
+
+	userIdString := strconv.Itoa(userid)
+	claims := jwt.NewWithClaims(jwt.SigningMethodHS512, jwt.StandardClaims{
+		Issuer:    userIdString,
+		ExpiresAt: time.Now().Add(time.Hour * 24 * 14).Unix(),
+	})
+
+	token, err := claims.SignedString([]byte(os.Getenv("JWT_SECRET")))
+	if err != nil {
+		internalServerErrorResponse(w)
+	} else {
+		cookie := http.Cookie{
+			Name:     "jwt",
+			Value:    token,
+			HttpOnly: true,
+		}
+		http.SetCookie(w, &cookie)
+	}
+}
+
+func registerAccount(w http.ResponseWriter, r *http.Request) {
+	if !enforceMethod(http.MethodPost, w, r) {
+		return
+	}
+	var details AuthenticationInfo
+	decodeSuccessful := decodeJSON(w, r, &details)
+	if !decodeSuccessful {
+		badRequestErrorResponse(w)
+		return
+	}
+	if !enforceNonEmptyValues(details, w) || !enforceValidUsername(details.Username, w) || !enforceValidPassword(details.Password, w) {
+		return
+	}
+
+	hashedPassword, err := hashPassword(details.Password)
+	if err != nil {
+		internalServerErrorResponse(w)
+		return
+	}
+	_, err = databasePool.Exec(context.Background(), "INSERT INTO users (id, username, password_hash)\nVALUES (DEFAULT, $1, $2);", details.Username, hashedPassword)
+	if err != nil {
+		//check if the username is a duplicate entry
+		if strings.Contains(err.Error(), "SQLSTATE 23505") {
+			sendResponse(
+				w,
+				http.StatusConflict,
+				false,
+				"Username already taken",
+				"")
+		} else {
+			internalServerErrorResponse(w)
+		}
+		return
+	}
+
+	sendResponse(
+		w,
+		http.StatusOK,
+		true,
+		"",
+		"")
+}
+
 func main() {
 	loadEnv()
 	dbpool, err := pgxpool.Connect(context.Background(), os.Getenv("DATABASE_URL"))
@@ -248,7 +316,9 @@ func main() {
 
 	http.HandleFunc("/api/register", registerAccount)
 	http.HandleFunc("/api/login", loginUser)
+	http.HandleFunc("/api/testJwt", testJwt)
 
+	println("starting server")
 	err = http.ListenAndServe(":8080", nil)
 	if err != nil {
 		io.WriteString(os.Stderr, "Could not start server!")
