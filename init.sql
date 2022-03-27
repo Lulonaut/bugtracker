@@ -6,8 +6,10 @@ create table Users (
 
 create table Projects(
     id serial primary key,
-    name varchar[31],
-    description varchar
+    owner integer,
+    name varchar unique,
+    description varchar,
+    public BOOLEAN
 );
 
 create table Issues (
