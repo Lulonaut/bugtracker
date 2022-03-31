@@ -36,6 +36,10 @@ type NewProjectInfo struct {
 	Description string
 }
 
+type DeleteProjectInfo struct {
+	Name string
+}
+
 func enforceValidPassword(password string, w http.ResponseWriter) bool {
 	length := len(password)
 	if length < 6 || length > 512 {
@@ -172,10 +176,10 @@ func getUserIdFromJwt(w http.ResponseWriter, r *http.Request) int {
 }
 
 func createProject(w http.ResponseWriter, r *http.Request) {
-	if !enforceMethod(http.MethodPost, w, r) {
+	userid := getUserIdFromJwt(w, r)
+	if !enforceMethod(http.MethodPost, w, r) || userid == -1 {
 		return
 	}
-	userid := getUserIdFromJwt(w, r)
 	var details NewProjectInfo
 	decodeSuccessful := decodeJSON(w, r, &details)
 	if !decodeSuccessful {
@@ -194,15 +198,47 @@ func createProject(w http.ResponseWriter, r *http.Request) {
 
 	var id int
 	err = databasePool.QueryRow(context.Background(), "select id from projects where name=$1", details.Name).Scan(&id)
+	if err != nil {
+		internalServerErrorResponse(w)
+		return
+	}
 	sendResponse(w, http.StatusCreated, true, "", strconv.Itoa(id))
 }
 
+func deleteProject(w http.ResponseWriter, r *http.Request) {
+	userid := getUserIdFromJwt(w, r)
+	if !enforceMethod(http.MethodPost, w, r) || userid == -1 {
+		return
+	}
+	var details DeleteProjectInfo
+	decodeSuccessful := decodeJSON(w, r, &details)
+	if !decodeSuccessful {
+		badRequestErrorResponse(w)
+		return
+	}
+	var id int
+	var owner int
+	err := databasePool.QueryRow(context.Background(), "select id, owner from projects where name=$1", details.Name).Scan(&id, &owner)
+	if err != nil || userid != owner {
+		badRequestErrorResponse(w)
+		return
+	}
+	//delete from Projects where id = '8';
+	_, err = databasePool.Exec(context.Background(), "delete from Projects where id = $1;", id)
+	if err != nil {
+		internalServerErrorResponse(w)
+		return
+	} else {
+		sendResponse(w, http.StatusOK, true, "", "")
+	}
+}
+
 func testJwt(w http.ResponseWriter, r *http.Request) {
-	if !enforceMethod(http.MethodPost, w, r) {
+	userid := getUserIdFromJwt(w, r)
+	if !enforceMethod(http.MethodPost, w, r) || userid == -1 {
 		return
 	}
 
-	userid := getUserIdFromJwt(w, r)
 	sendResponse(w, http.StatusOK, true, "", strconv.Itoa(userid))
 }
 
@@ -297,6 +333,7 @@ func main() {
 	http.HandleFunc("/api/login", loginUser)
 	http.HandleFunc("/api/testJwt", testJwt)
 	http.HandleFunc("/api/projects/create", createProject)
+	http.HandleFunc("/api/projects/delete", deleteProject)
 
 	println("starting server")
 	err = http.ListenAndServe(":8080", nil)
